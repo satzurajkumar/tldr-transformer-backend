@@ -1,65 +1,63 @@
 # main.py
 import os
 import logging
-import re
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Dict
 
-import nltk # Ensure NLTK is imported
+import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords, wordnet
 from nltk.stem import WordNetLemmatizer
 
-
-from dotenv import load_dotenv
-
-from fastapi import FastAPI, HTTPException, Security, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel, Field
-from starlette.concurrency import run_in_threadpool # For running sync code in async context
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field, EmailStr
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from starlette.concurrency import run_in_threadpool
 from collections import Counter
 
 # --- Configuration & Initialization ---
-
-# Logging Configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# API Key Configuration
-EXPECTED_API_KEY = os.getenv("TOPIC_DISCOVERER_API_KEY", "your_super_secret_api_key_here_12345")
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+# JWT Configuration - GET THESE FROM ENVIRONMENT VARIABLES IN PRODUCTION
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-jwt-key-please-change-me")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+
+# Password Hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Topic Discoverer API (NLTK)",
-    version="1.1.1", # Incremented version for the fix
-    description="API for analyzing text to discover topics using NLP (NLTK)."
+    title="Topic Discoverer API (NLTK with Auth)",
+    version="1.2.0",
+    description="API for analyzing text to discover topics using NLP (NLTK), with JWT authentication."
 )
 
 # CORS Configuration
 origins = [
     "chrome-extension://your_extension_id_here", # Replace with your actual extension ID
-    "http://localhost",
+    "http://localhost", # For local testing if needed
+    # Add other origins for development/production frontends if necessary
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins, # Be more specific in production
     allow_credentials=True,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["*", API_KEY_NAME, "Content-Type"],
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
 )
 
-# --- NLTK Setup ---
+# --- NLTK Setup (same as before) ---
 lemmatizer = None
 nltk_stop_words = None
-
 REQUIRED_NLTK_RESOURCES = {
-    "tokenizers/punkt": "punkt",
-    "corpora/stopwords": "stopwords",
+    "tokenizers/punkt": "punkt", "corpora/stopwords": "stopwords",
     "taggers/averaged_perceptron_tagger": "averaged_perceptron_tagger",
-    "corpora/wordnet": "wordnet",
-    "corpora/omw-1.4": "omw-1.4"  # Open Multilingual Wordnet, needed by WordNetLemmatizer
+    "corpora/wordnet": "wordnet", "corpora/omw-1.4": "omw-1.4"
 }
 
 @app.on_event("startup")
@@ -70,57 +68,135 @@ async def startup_event():
         try:
             nltk.data.find(path)
             logger.info(f"NLTK resource '{resource_id}' found.")
-        except LookupError: # Corrected: Only catch LookupError here
+        except LookupError:
             logger.warning(f"NLTK resource '{resource_id}' not found. Downloading...")
             try:
                 nltk.download(resource_id, quiet=True)
                 logger.info(f"NLTK resource '{resource_id}' downloaded successfully.")
-            except Exception as download_e: # Generic exception for download failure
+            except Exception as download_e:
                 logger.error(f"Failed to download NLTK resource '{resource_id}': {download_e}")
-                # Depending on the resource, you might want to raise an error or exit
-    
     lemmatizer = WordNetLemmatizer()
     nltk_stop_words = set(stopwords.words('english'))
     logger.info("NLTK Lemmatizer and stopwords initialized.")
 
+# --- User Data Store (In-memory for this example) ---
+# In a real application, use a database (e.g., PostgreSQL, MySQL with SQLAlchemy)
+fake_users_db: Dict[str, Dict[str, str]] = {} # username: {"hashed_password": "...", "email": "..."}
 
-# --- Pydantic Models (remain the same) ---
+# --- Pydantic Models ---
+class UserBase(BaseModel):
+    username: str = Field(..., min_length=3)
+    email: Optional[EmailStr] = None
+
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=6)
+
+class UserInDB(UserBase):
+    hashed_password: str
+
+class UserPublic(UserBase): # For returning user info without password
+    pass
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
 class TextPayload(BaseModel):
-    text: str = Field(..., min_length=50, description="Text content to be analyzed. Minimum 50 characters.")
+    text: str = Field(..., min_length=50)
 
 class KeywordsResponse(BaseModel):
     keywords: List[str]
     message: Optional[str] = None
 
-class ErrorResponse(BaseModel):
+class ErrorResponse(BaseModel): # Re-added for consistency if needed, though FastAPI handles many
     detail: str
 
-# --- API Key Dependency (remains the same) ---
-async def get_api_key(api_key_received: str = Security(api_key_header)):
-    if not api_key_received:
-        logger.warning("API key missing in request.")
-        raise HTTPException(status_code=403, detail="API key is missing.")
-    if api_key_received == EXPECTED_API_KEY:
-        return api_key_received
-    else:
-        logger.warning("Invalid API key received.")
-        raise HTTPException(status_code=403, detail="Invalid API key.")
+# --- Authentication Utilities ---
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login") # Points to the login endpoint
 
-# --- Helper function for NLTK POS tagging to WordNet POS tags ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserPublic:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    
+    user_data = fake_users_db.get(token_data.username)
+    if user_data is None:
+        raise credentials_exception
+    return UserPublic(username=token_data.username, email=user_data.get("email"))
+
+
+# --- Authentication Endpoints ---
+auth_router = FastAPI() # Using a sub-router for auth clarity
+
+@auth_router.post("/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
+async def register_user(user: UserCreate):
+    if user.username in fake_users_db:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    hashed_password = get_password_hash(user.password)
+    fake_users_db[user.username] = {"hashed_password": hashed_password, "email": user.email}
+    logger.info(f"User '{user.username}' registered successfully.")
+    return UserPublic(username=user.username, email=user.email)
+
+@auth_router.post("/login", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user_data = fake_users_db.get(form_data.username)
+    if not user_data or not verify_password(form_data.password, user_data["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": form_data.username}, expires_delta=access_token_expires
+    )
+    logger.info(f"User '{form_data.username}' logged in successfully.")
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@auth_router.get("/users/me", response_model=UserPublic)
+async def read_users_me(current_user: UserPublic = Depends(get_current_user)):
+    return current_user
+
+app.include_router(auth_router, prefix="/auth", tags=["authentication"])
+
+
+# --- NLTK Processing Logic (same as before) ---
 def get_wordnet_pos(treebank_tag):
-    """Converts treebank POS tags to WordNet POS tags for lemmatization."""
-    if treebank_tag.startswith('J'):
-        return wordnet.ADJ
-    elif treebank_tag.startswith('V'):
-        return wordnet.VERB
-    elif treebank_tag.startswith('N'):
-        return wordnet.NOUN
-    elif treebank_tag.startswith('R'):
-        return wordnet.ADV
-    else:
-        return wordnet.NOUN # Default to noun
+    if treebank_tag.startswith('J'): return wordnet.ADJ
+    elif treebank_tag.startswith('V'): return wordnet.VERB
+    elif treebank_tag.startswith('N'): return wordnet.NOUN
+    elif treebank_tag.startswith('R'): return wordnet.ADV
+    else: return wordnet.NOUN
 
-# --- Helper function for NLP processing with NLTK ---
 CUSTOM_STOP_WORDS = {
     "page", "site", "website", "article", "content", "information", "click", "view", "menu",
     "home", "search", "contact", "news", "post", "blog", "comment", "read", "more", "share",
@@ -133,95 +209,58 @@ CUSTOM_STOP_WORDS = {
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "today", "yesterday", "tomorrow",
     "get", "make", "see", "say", "tell", "ask", "go", "come", "know", "time", "year", "day", "way", "man", "thing", "woman", "life", "child", "world", "school", "state", "family", "student", "group", "country", "problem", "hand", "part", "place", "case", "week", "system", "program", "question", "work", "government", "number", "night", "point", "home", "water", "room", "mother", "area", "money", "story", "fact", "month", "lot", "right", "study", "book", "eye", "job", "word", "business", "issue", "side", "kind", "head", "house", "service", "friend", "father", "power", "hour", "game", "line", "end", "member", "law", "car", "city", "community", "name", "president", "team", "minute", "idea", "kid", "body", "back", "parent", "face", "others", "level", "office", "door", "health", "person", "art", "war", "history", "party", "result", "change", "morning", "reason", "research", "girl", "guy", "moment", "air", "teacher", "force", "education"
 }
-
 def process_text_with_nltk(text_to_analyze: str):
-    global lemmatizer, nltk_stop_words 
-
+    global lemmatizer, nltk_stop_words
     if not lemmatizer or not nltk_stop_words:
-        logger.error("NLTK lemmatizer or stopwords not initialized. Cannot process text.")
-        raise RuntimeError("NLP resources not available. Initialization might have failed.")
-
+        raise RuntimeError("NLP resources not available.")
     words = word_tokenize(text_to_analyze.lower())
     all_stop_words = nltk_stop_words.union(CUSTOM_STOP_WORDS)
-    
-    filtered_words = [
-        word for word in words 
-        if word.isalpha() and word not in all_stop_words and len(word) > 2
-    ]
-    
-    if not filtered_words:
-        return [], "No meaningful words found after initial filtering."
-
+    filtered_words = [w for w in words if w.isalpha() and w not in all_stop_words and len(w) > 2]
+    if not filtered_words: return [], "No meaningful words after filtering."
     pos_tags = nltk.pos_tag(filtered_words)
     lemmatized_nouns = []
     for word, tag in pos_tags:
-        if tag.startswith('NN'): 
+        if tag.startswith('NN'):
             lemma = lemmatizer.lemmatize(word, pos=get_wordnet_pos(tag))
-            if len(lemma) > 2 and lemma not in all_stop_words : 
-                 lemmatized_nouns.append(lemma)
-    
-    if not lemmatized_nouns:
-        return [], "No nouns found after POS tagging and lemmatization."
-
+            if len(lemma) > 2 and lemma not in all_stop_words:
+                lemmatized_nouns.append(lemma)
+    if not lemmatized_nouns: return [], "No nouns after lemmatization."
     keyword_counts = Counter(lemmatized_nouns)
-    min_frequency = 2 if len(keyword_counts) > 10 else 1
-    top_keywords = [kw for kw, count in keyword_counts.most_common(20) if count >= min_frequency]
-    final_keywords = sorted(list(set(top_keywords)), key=lambda x: keyword_counts[x], reverse=True)[:10]
+    min_freq = 2 if len(keyword_counts) > 10 else 1
+    top_kws = [kw for kw, count in keyword_counts.most_common(20) if count >= min_freq]
+    final_kws = sorted(list(set(top_kws)), key=lambda x: keyword_counts[x], reverse=True)[:10]
+    if not final_kws: return [], "Keywords did not meet frequency/uniqueness criteria."
+    return final_kws, "Keywords extracted successfully (NLTK)."
 
-    if not final_keywords:
-        return [], "Keywords found but did not meet frequency or uniqueness criteria."
-        
-    return final_keywords, "Keywords extracted successfully using NLTK."
-
-
-# --- API Endpoints ---
+# --- Protected Analyze Endpoint ---
 @app.post(
     "/analyze",
     response_model=KeywordsResponse,
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid input"},
-        403: {"model": ErrorResponse, "description": "API key missing or invalid"},
-        500: {"model": ErrorResponse, "description": "Internal server error"},
-        503: {"model": ErrorResponse, "description": "Service unavailable (e.g., NLP resources not loaded)"}
-    },
-    summary="Analyze text for keywords (NLTK)",
-    description="Accepts text, returns potential keywords based on NLTK analysis (noun extraction, lemmatization)."
+    summary="Analyze text for keywords (NLTK, Auth Required)",
 )
 async def analyze_text_endpoint(
     payload: TextPayload,
-    api_key: str = Depends(get_api_key)
+    current_user: UserPublic = Depends(get_current_user) # This protects the endpoint
 ):
-    if not lemmatizer or not nltk_stop_words: 
-        logger.error("Attempted to use /analyze endpoint but NLTK resources are not initialized.")
-        raise HTTPException(status_code=503, detail="NLP service is not available. Resources not initialized.")
-
+    if not lemmatizer or not nltk_stop_words:
+        raise HTTPException(status_code=503, detail="NLP service not ready.")
     try:
-        logger.info(f"NLTK: Received analysis request for text starting with: {payload.text[:100]}...")
-        
+        logger.info(f"User '{current_user.username}' requested analysis for text: {payload.text[:50]}...")
         keywords, message = await run_in_threadpool(process_text_with_nltk, payload.text)
-        
-        logger.info(f"NLTK Analysis complete. Keywords: {keywords}, Message: {message}")
         return KeywordsResponse(keywords=keywords, message=message)
-
-    except RuntimeError as e: 
-        logger.error(f"Runtime error during NLTK analysis: {e}")
+    except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        logger.exception(f"Unexpected error during NLTK text analysis: {e}")
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
+        logger.exception(f"Unexpected error during NLTK analysis for user '{current_user.username}': {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during analysis.")
 
-@app.get("/health", summary="Health Check", description="Simple health check endpoint.")
+# --- Health Check  ---
+@app.get("/health", summary="Health Check")
 async def health_check():
     if lemmatizer and nltk_stop_words:
-        return {"status": "ok", "message": "API is running and NLTK resources are initialized."}
+        return {"status": "ok", "message": "API running, NLTK resources initialized."}
     else:
-        missing_resources = []
-        if not lemmatizer: missing_resources.append("Lemmatizer")
-        if not nltk_stop_words: missing_resources.append("NLTK Stopwords")
-        return {
-            "status": "degraded", 
-            "message": f"API is running, but some NLTK resources are not initialized: {', '.join(missing_resources)}."
-        }
+       
+        return {"status": "degraded", "message": "API running, NLTK resources not fully initialized."}
 
-# --- How to run (for development) ---
-# Run with Uvicorn: uvicorn main:app --reload --port 8000
+

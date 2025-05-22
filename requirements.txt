@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 nltk
 python-dotenv
+passlib[bcrypt]
+python-jose[cryptography]
