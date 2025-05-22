@@ -8,7 +8,9 @@ import nltk # Ensure NLTK is imported
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords, wordnet
 from nltk.stem import WordNetLemmatizer
-# No direct import from nltk.downloader needed for DownloadError
+
+
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException, Security, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
