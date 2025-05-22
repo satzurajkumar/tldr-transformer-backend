@@ -4,10 +4,11 @@ import logging
 import re
 from typing import List, Optional
 
-import nltk
+import nltk # Ensure NLTK is imported
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords, wordnet
 from nltk.stem import WordNetLemmatizer
+# No direct import from nltk.downloader needed for DownloadError
 
 from fastapi import FastAPI, HTTPException, Security, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,13 +31,13 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 # Initialize FastAPI app
 app = FastAPI(
     title="Topic Discoverer API (NLTK)",
-    version="1.1.0",
+    version="1.1.1", # Incremented version for the fix
     description="API for analyzing text to discover topics using NLP (NLTK)."
 )
 
 # CORS Configuration
 origins = [
-    "chrome-extension://your_extension_id_here",
+    "chrome-extension://your_extension_id_here", # Replace with your actual extension ID
     "http://localhost",
 ]
 app.add_middleware(
@@ -67,12 +68,12 @@ async def startup_event():
         try:
             nltk.data.find(path)
             logger.info(f"NLTK resource '{resource_id}' found.")
-        except (LookupError, nltk.downloader.DownloadError): # Catch both LookupError and DownloadError
+        except LookupError: # Corrected: Only catch LookupError here
             logger.warning(f"NLTK resource '{resource_id}' not found. Downloading...")
             try:
                 nltk.download(resource_id, quiet=True)
                 logger.info(f"NLTK resource '{resource_id}' downloaded successfully.")
-            except Exception as download_e:
+            except Exception as download_e: # Generic exception for download failure
                 logger.error(f"Failed to download NLTK resource '{resource_id}': {download_e}")
                 # Depending on the resource, you might want to raise an error or exit
     
@@ -128,26 +129,19 @@ CUSTOM_STOP_WORDS = {
     "nbsp", "amp", "quot", "apos", "lt", "gt", "advertisement", "cookie", "cookies", "settings",
     "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "today", "yesterday", "tomorrow",
-    # Common web/generic terms
     "get", "make", "see", "say", "tell", "ask", "go", "come", "know", "time", "year", "day", "way", "man", "thing", "woman", "life", "child", "world", "school", "state", "family", "student", "group", "country", "problem", "hand", "part", "place", "case", "week", "system", "program", "question", "work", "government", "number", "night", "point", "home", "water", "room", "mother", "area", "money", "story", "fact", "month", "lot", "right", "study", "book", "eye", "job", "word", "business", "issue", "side", "kind", "head", "house", "service", "friend", "father", "power", "hour", "game", "line", "end", "member", "law", "car", "city", "community", "name", "president", "team", "minute", "idea", "kid", "body", "back", "parent", "face", "others", "level", "office", "door", "health", "person", "art", "war", "history", "party", "result", "change", "morning", "reason", "research", "girl", "guy", "moment", "air", "teacher", "force", "education"
 }
 
 def process_text_with_nltk(text_to_analyze: str):
-    global lemmatizer, nltk_stop_words # Access initialized lemmatizer and stopwords
+    global lemmatizer, nltk_stop_words 
 
     if not lemmatizer or not nltk_stop_words:
         logger.error("NLTK lemmatizer or stopwords not initialized. Cannot process text.")
         raise RuntimeError("NLP resources not available. Initialization might have failed.")
 
-    # 1. Tokenize and lowercase
     words = word_tokenize(text_to_analyze.lower())
-
-    # 2. Filter out stopwords, punctuation, and very short words
-    # Also combine NLTK stopwords with custom ones
     all_stop_words = nltk_stop_words.union(CUSTOM_STOP_WORDS)
     
-    # Improved filtering: remove punctuation more effectively and ensure words are alphabetic
-    # and not in stop words list, and have a minimum length.
     filtered_words = [
         word for word in words 
         if word.isalpha() and word not in all_stop_words and len(word) > 2
@@ -156,36 +150,21 @@ def process_text_with_nltk(text_to_analyze: str):
     if not filtered_words:
         return [], "No meaningful words found after initial filtering."
 
-    # 3. Part-of-Speech Tagging
     pos_tags = nltk.pos_tag(filtered_words)
-
-    # 4. Lemmatize Nouns and Proper Nouns
     lemmatized_nouns = []
     for word, tag in pos_tags:
-        # Consider nouns (NN, NNS) and proper nouns (NNP, NNPS)
-        # Adjectives (JJ, JJR, JJS) can also be interesting if combined with nouns, but for simplicity, focus on nouns.
-        if tag.startswith('NN'): # Catches NN, NNS, NNP, NNPS
+        if tag.startswith('NN'): 
             lemma = lemmatizer.lemmatize(word, pos=get_wordnet_pos(tag))
-            if len(lemma) > 2 and lemma not in all_stop_words : # Double check lemma against stopwords
+            if len(lemma) > 2 and lemma not in all_stop_words : 
                  lemmatized_nouns.append(lemma)
     
     if not lemmatized_nouns:
         return [], "No nouns found after POS tagging and lemmatization."
 
-    # 5. Count frequencies
     keyword_counts = Counter(lemmatized_nouns)
-    
-    # 6. Get top N keywords (e.g., top 10)
-    # Filter for keywords that appear more than once, unless very few keywords overall
     min_frequency = 2 if len(keyword_counts) > 10 else 1
-    
-    # Get most common, ensuring they meet min_frequency
-    # Taking more initially to allow for variety if some are very similar
     top_keywords = [kw for kw, count in keyword_counts.most_common(20) if count >= min_frequency]
-
-    # Ensure uniqueness (though lemmatization helps) and limit to 10
     final_keywords = sorted(list(set(top_keywords)), key=lambda x: keyword_counts[x], reverse=True)[:10]
-
 
     if not final_keywords:
         return [], "Keywords found but did not meet frequency or uniqueness criteria."
@@ -210,7 +189,7 @@ async def analyze_text_endpoint(
     payload: TextPayload,
     api_key: str = Depends(get_api_key)
 ):
-    if not lemmatizer or not nltk_stop_words: # Check if NLTK resources are ready
+    if not lemmatizer or not nltk_stop_words: 
         logger.error("Attempted to use /analyze endpoint but NLTK resources are not initialized.")
         raise HTTPException(status_code=503, detail="NLP service is not available. Resources not initialized.")
 
@@ -222,7 +201,7 @@ async def analyze_text_endpoint(
         logger.info(f"NLTK Analysis complete. Keywords: {keywords}, Message: {message}")
         return KeywordsResponse(keywords=keywords, message=message)
 
-    except RuntimeError as e: # Catch specific RuntimeError if NLP resources fail within process_text_with_nltk
+    except RuntimeError as e: 
         logger.error(f"Runtime error during NLTK analysis: {e}")
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -243,6 +222,4 @@ async def health_check():
         }
 
 # --- How to run (for development) ---
-# 1. Ensure API key is set (e.g., environment variable TOPIC_DISCOVERER_API_KEY)
-# 2. Install dependencies: pip install -r requirements.txt (ensure nltk is in it)
-# 3. Run with Uvicorn: uvicorn main:app --reload --port 8000
+# Run with Uvicorn: uvicorn main:app --reload --port 8000
